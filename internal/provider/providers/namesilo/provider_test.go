@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/qdm12/ddns-updater/pkg/publicip/ipversion"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -153,14 +154,13 @@ func writeJSON(t *testing.T, w http.ResponseWriter, r reply) {
 
 // providerForStub wires a Provider whose API endpoint points at the stub. The
 // real createRequestURL hardcodes www.namesilo.com, so we wrap the httptest URL
-// into a transport that rewrites the host on outbound requests. The domain is
-// fixed at "example.com" because the failure modes we care about live in the
-// (host, type) reconcile logic — varying the registered domain wouldn't add
-// coverage.
-func providerForStub(t *testing.T, stub *stubServer, owner string) (*Provider, *http.Client) {
+// into a transport that rewrites the host on outbound requests. Both domain
+// and owner are fixed (example.com / vpn) — the failure modes we care about
+// live in the (host, type) reconcile logic, not in the routing.
+func providerForStub(t *testing.T, stub *stubServer) (*Provider, *http.Client) {
 	t.Helper()
 
-	provider, err := New(json.RawMessage(`{"key":"test-key"}`), "example.com", owner, ipversion.IP4, netip.Prefix{})
+	provider, err := New(json.RawMessage(`{"key":"test-key"}`), "example.com", "vpn", ipversion.IP4, netip.Prefix{})
 	require.NoError(t, err)
 
 	stubURL, err := url.Parse(stub.server.URL)
@@ -192,7 +192,7 @@ func Test_Update_creates_record_when_missing(t *testing.T) {
 	t.Parallel()
 
 	stub := newStub(t, nil)
-	provider, client := providerForStub(t, stub, "vpn")
+	provider, client := providerForStub(t, stub)
 
 	newIP := netip.MustParseAddr("1.1.1.1")
 	got, err := provider.Update(context.Background(), client, newIP)
@@ -215,7 +215,7 @@ func Test_Update_updates_existing_record_on_ip_change(t *testing.T) {
 	stub := newStub(t, []resourceRecord{{
 		ID: "abc", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1",
 	}})
-	provider, client := providerForStub(t, stub, "vpn")
+	provider, client := providerForStub(t, stub)
 
 	newIP := netip.MustParseAddr("1.1.1.2")
 	got, err := provider.Update(context.Background(), client, newIP)
@@ -241,7 +241,7 @@ func Test_Update_deletes_duplicates_left_by_old_buggy_versions(t *testing.T) {
 		{ID: "old", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1"},
 		{ID: "new", Type: "A", Host: "vpn.example.com", Value: "1.1.1.2"},
 	})
-	provider, client := providerForStub(t, stub, "vpn")
+	provider, client := providerForStub(t, stub)
 
 	newIP := netip.MustParseAddr("1.1.1.2")
 	got, err := provider.Update(context.Background(), client, newIP)
@@ -264,7 +264,7 @@ func Test_Update_noop_when_record_already_correct(t *testing.T) {
 	stub := newStub(t, []resourceRecord{{
 		ID: "abc", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1",
 	}})
-	provider, client := providerForStub(t, stub, "vpn")
+	provider, client := providerForStub(t, stub)
 
 	newIP := netip.MustParseAddr("1.1.1.1")
 	got, err := provider.Update(context.Background(), client, newIP)
@@ -282,7 +282,7 @@ func Test_Update_matches_host_with_trailing_dot_or_case_quirks(t *testing.T) {
 	stub := newStub(t, []resourceRecord{{
 		ID: "abc", Type: "A", Host: "VPN.Example.com.", Value: "1.1.1.1",
 	}})
-	provider, client := providerForStub(t, stub, "vpn")
+	provider, client := providerForStub(t, stub)
 
 	newIP := netip.MustParseAddr("1.1.1.2")
 	got, err := provider.Update(context.Background(), client, newIP)
@@ -301,7 +301,7 @@ func Test_Update_deletes_extras_and_updates_when_no_existing_matches_newIP(t *te
 		{ID: "stale-a", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1"},
 		{ID: "stale-b", Type: "A", Host: "vpn.example.com", Value: "5.5.5.5"},
 	})
-	provider, client := providerForStub(t, stub, "vpn")
+	provider, client := providerForStub(t, stub)
 
 	newIP := netip.MustParseAddr("1.1.1.2")
 	got, err := provider.Update(context.Background(), client, newIP)
@@ -323,7 +323,7 @@ func Test_Update_ignores_unrelated_records(t *testing.T) {
 		{ID: "mx", Type: "MX", Host: "example.com", Value: "mail.example.com"},
 		{ID: "other", Type: "A", Host: "other.example.com", Value: "9.9.9.9"},
 	})
-	provider, client := providerForStub(t, stub, "vpn")
+	provider, client := providerForStub(t, stub)
 
 	newIP := netip.MustParseAddr("1.1.1.1")
 	_, err := provider.Update(context.Background(), client, newIP)

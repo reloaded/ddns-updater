@@ -11,10 +11,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/qdm12/ddns-updater/pkg/publicip/ipversion"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/qdm12/ddns-updater/pkg/publicip/ipversion"
 )
 
 func Test_hostMatches(t *testing.T) {
@@ -25,14 +24,30 @@ func Test_hostMatches(t *testing.T) {
 		expectedHost string
 		match        bool
 	}{
-		"exact":              {"vpn.example.com", "vpn.example.com", true},
-		"trailing_dot":       {"vpn.example.com.", "vpn.example.com", true},
-		"uppercase":          {"VPN.Example.com", "vpn.example.com", true},
-		"different":          {"other.example.com", "vpn.example.com", false},
-		"different_suffix":   {"vpn.example.net", "vpn.example.com", false},
-		"empty_vs_anything":  {"", "vpn.example.com", false},
-		"both_empty":         {"", "", true},
-		"trailing_dot_both":  {"vpn.example.com.", "vpn.example.com.", true},
+		"exact": {
+			recordHost: "vpn.example.com", expectedHost: "vpn.example.com", match: true,
+		},
+		"trailing_dot": {
+			recordHost: "vpn.example.com.", expectedHost: "vpn.example.com", match: true,
+		},
+		"uppercase": {
+			recordHost: "VPN.Example.com", expectedHost: "vpn.example.com", match: true,
+		},
+		"different": {
+			recordHost: "other.example.com", expectedHost: "vpn.example.com", match: false,
+		},
+		"different_suffix": {
+			recordHost: "vpn.example.net", expectedHost: "vpn.example.com", match: false,
+		},
+		"empty_vs_anything": {
+			recordHost: "", expectedHost: "vpn.example.com", match: false,
+		},
+		"both_empty": {
+			recordHost: "", expectedHost: "", match: true,
+		},
+		"trailing_dot_both": {
+			recordHost: "vpn.example.com.", expectedHost: "vpn.example.com.", match: true,
+		},
 	}
 
 	for name, tc := range testCases {

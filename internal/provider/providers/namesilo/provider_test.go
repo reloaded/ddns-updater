@@ -11,10 +11,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/qdm12/ddns-updater/pkg/publicip/ipversion"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/qdm12/ddns-updater/pkg/publicip/ipversion"
 )
 
 func Test_hostMatches(t *testing.T) {

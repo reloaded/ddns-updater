@@ -217,16 +217,28 @@ func (p *Provider) Update(ctx context.Context, client *http.Client, newIP netip.
 	return newIP, nil
 }
 
-// hostMatches compares NameSilo's host field against the expected FQDN
-// tolerantly: case-insensitive and ignoring an optional trailing dot. The old
-// strict equality check meant any quirk in how NameSilo returned the host
-// (uppercase, absolute "name.example.com.") caused getRecord to miss the
-// existing record and fall back to dnsAddRecord, leaving a duplicate behind.
-func hostMatches(recordHost, expectedHost string) bool {
-	return strings.EqualFold(
-		strings.TrimSuffix(recordHost, "."),
-		strings.TrimSuffix(expectedHost, "."),
-	)
+// hostMatches reports whether a host field from dnsListRecords belongs to this
+// provider's (owner, domain).
+//
+// NameSilo's dnsListRecords returns the *relative* host — i.e. just the owner
+// label ("vpn"), or "" for the apex — NOT the fully-qualified name. Comparing
+// the relative host against a synthesized FQDN ("vpn.example.com") therefore
+// never matched, so getRecords found nothing, the updater fell through to
+// dnsAddRecord, and NameSilo either created a duplicate (when the public IP was
+// new) or rejected the add as "already exists". This was the real root cause of
+// the duplicate-record bug.
+//
+// We compare against the relative owner (mapping the apex "@" to ""), and still
+// accept the fully-qualified form defensively in case the API ever returns it.
+// Both comparisons are case-insensitive and tolerate a trailing dot.
+func (p *Provider) hostMatches(recordHost string) bool {
+	recordHost = strings.TrimSuffix(strings.ToLower(recordHost), ".")
+	owner := strings.ToLower(p.owner)
+	if owner == "@" {
+		owner = ""
+	}
+	fqdn := strings.TrimSuffix(strings.ToLower(p.BuildDomainName()), ".")
+	return recordHost == owner || recordHost == fqdn
 }
 
 // getRecords returns every record matching (host, type). An empty slice with a
@@ -245,9 +257,8 @@ func (p *Provider) getRecords(ctx context.Context, client *http.Client, recordTy
 		return nil, err
 	}
 
-	expectedHost := utils.BuildURLQueryHostname(p.owner, p.domain)
 	for _, record := range response.Reply.Records {
-		if !hostMatches(record.Host, expectedHost) || record.Type != recordType {
+		if !p.hostMatches(record.Host) || record.Type != recordType {
 			continue
 		}
 		records = append(records, matchedRecord{ID: record.ID, Value: record.Value})

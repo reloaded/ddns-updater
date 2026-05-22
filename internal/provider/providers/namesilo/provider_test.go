@@ -52,40 +52,48 @@ func Test_hostMatches(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
-		recordHost   string
-		expectedHost string
-		match        bool
+		owner      string
+		domain     string
+		recordHost string
+		match      bool
 	}{
-		"exact": {
-			recordHost: "vpn.example.com", expectedHost: "vpn.example.com", match: true,
+		// NameSilo returns the relative host (just the owner label).
+		"relative_owner": {
+			owner: "vpn", domain: "example.com", recordHost: "vpn", match: true,
 		},
-		"trailing_dot": {
-			recordHost: "vpn.example.com.", expectedHost: "vpn.example.com", match: true,
+		"relative_owner_uppercase": {
+			owner: "vpn", domain: "example.com", recordHost: "VPN", match: true,
 		},
-		"uppercase": {
-			recordHost: "VPN.Example.com", expectedHost: "vpn.example.com", match: true,
+		"relative_owner_mismatch": {
+			owner: "vpn", domain: "example.com", recordHost: "other", match: false,
 		},
-		"different": {
-			recordHost: "other.example.com", expectedHost: "vpn.example.com", match: false,
+		// Defensive: accept the fully-qualified form too.
+		"fqdn_fallback": {
+			owner: "vpn", domain: "example.com", recordHost: "vpn.example.com", match: true,
 		},
-		"different_suffix": {
-			recordHost: "vpn.example.net", expectedHost: "vpn.example.com", match: false,
+		"fqdn_trailing_dot": {
+			owner: "vpn", domain: "example.com", recordHost: "vpn.example.com.", match: true,
 		},
-		"empty_vs_anything": {
-			recordHost: "", expectedHost: "vpn.example.com", match: false,
+		"fqdn_wrong_domain": {
+			owner: "vpn", domain: "example.com", recordHost: "vpn.example.net", match: false,
 		},
-		"both_empty": {
-			recordHost: "", expectedHost: "", match: true,
+		// Apex: owner "@" maps to an empty relative host.
+		"apex_empty_host": {
+			owner: "@", domain: "example.com", recordHost: "", match: true,
 		},
-		"trailing_dot_both": {
-			recordHost: "vpn.example.com.", expectedHost: "vpn.example.com.", match: true,
+		"apex_fqdn": {
+			owner: "@", domain: "example.com", recordHost: "example.com", match: true,
+		},
+		"apex_vs_subdomain": {
+			owner: "@", domain: "example.com", recordHost: "vpn", match: false,
 		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tc.match, hostMatches(tc.recordHost, tc.expectedHost))
+			p := &Provider{owner: tc.owner, domain: tc.domain}
+			assert.Equal(t, tc.match, p.hostMatches(tc.recordHost))
 		})
 	}
 }
@@ -153,16 +161,12 @@ func (s *stubServer) handle(w http.ResponseWriter, r *http.Request) {
 	case "/api/dnsListRecords":
 		writeJSON(s.t, w, reply{Code: "300", Detail: "success", Records: s.records})
 	case "/api/dnsAddRecord":
-		host := q.Get("rrhost")
-		domain := q.Get("domain")
-		fqdn := host + "." + domain
-		if host == "" {
-			fqdn = domain
-		}
+		// NameSilo stores and later returns the relative host (the rrhost
+		// value, i.e. just the owner label), not the FQDN.
 		s.records = append(s.records, resourceRecord{
 			ID:    "new-" + q.Get("rrvalue"),
 			Type:  q.Get("rrtype"),
-			Host:  fqdn,
+			Host:  q.Get("rrhost"),
 			Value: q.Get("rrvalue"),
 		})
 		writeJSON(s.t, w, reply{Code: "300", Detail: "success"})
@@ -252,7 +256,7 @@ func Test_Update_creates_record_when_missing(t *testing.T) {
 
 	current := stub.currentRecords()
 	require.Len(t, current, 1)
-	assert.Equal(t, "vpn.example.com", current[0].Host)
+	assert.Equal(t, "vpn", current[0].Host) // NameSilo stores the relative host
 	assert.Equal(t, "1.1.1.1", current[0].Value)
 }
 
@@ -260,7 +264,7 @@ func Test_Update_updates_existing_record_on_ip_change(t *testing.T) {
 	t.Parallel()
 
 	stub := newStub(t, []resourceRecord{{
-		ID: "abc", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1",
+		ID: "abc", Type: "A", Host: "vpn", Value: "1.1.1.1",
 	}})
 	provider, client := providerForStub(t, stub)
 
@@ -285,8 +289,8 @@ func Test_Update_deletes_duplicates_left_by_old_buggy_versions(t *testing.T) {
 	t.Parallel()
 
 	stub := newStub(t, []resourceRecord{
-		{ID: "old", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1"},
-		{ID: "new", Type: "A", Host: "vpn.example.com", Value: "1.1.1.2"},
+		{ID: "old", Type: "A", Host: "vpn", Value: "1.1.1.1"},
+		{ID: "new", Type: "A", Host: "vpn", Value: "1.1.1.2"},
 	})
 	provider, client := providerForStub(t, stub)
 
@@ -309,7 +313,7 @@ func Test_Update_noop_when_record_already_correct(t *testing.T) {
 	t.Parallel()
 
 	stub := newStub(t, []resourceRecord{{
-		ID: "abc", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1",
+		ID: "abc", Type: "A", Host: "vpn", Value: "1.1.1.1",
 	}})
 	provider, client := providerForStub(t, stub)
 
@@ -323,7 +327,10 @@ func Test_Update_noop_when_record_already_correct(t *testing.T) {
 	assert.Equal(t, 0, stub.callCount("/api/dnsDeleteRecord"))
 }
 
-func Test_Update_matches_host_with_trailing_dot_or_case_quirks(t *testing.T) {
+// Test_Update_matches_fqdn_host_defensively covers the fallback where the API
+// returns a fully-qualified, mixed-case, trailing-dot host instead of the
+// relative one. It must still match the existing record (update, not add).
+func Test_Update_matches_fqdn_host_defensively(t *testing.T) {
 	t.Parallel()
 
 	stub := newStub(t, []resourceRecord{{
@@ -345,8 +352,8 @@ func Test_Update_deletes_extras_and_updates_when_no_existing_matches_newIP(t *te
 	t.Parallel()
 
 	stub := newStub(t, []resourceRecord{
-		{ID: "stale-a", Type: "A", Host: "vpn.example.com", Value: "1.1.1.1"},
-		{ID: "stale-b", Type: "A", Host: "vpn.example.com", Value: "5.5.5.5"},
+		{ID: "stale-a", Type: "A", Host: "vpn", Value: "1.1.1.1"},
+		{ID: "stale-b", Type: "A", Host: "vpn", Value: "5.5.5.5"},
 	})
 	provider, client := providerForStub(t, stub)
 
@@ -367,8 +374,8 @@ func Test_Update_ignores_unrelated_records(t *testing.T) {
 	t.Parallel()
 
 	stub := newStub(t, []resourceRecord{
-		{ID: "mx", Type: "MX", Host: "example.com", Value: "mail.example.com"},
-		{ID: "other", Type: "A", Host: "other.example.com", Value: "9.9.9.9"},
+		{ID: "mx", Type: "MX", Host: "", Value: "mail.example.com"}, // apex MX
+		{ID: "other", Type: "A", Host: "other", Value: "9.9.9.9"},
 	})
 	provider, client := providerForStub(t, stub)
 
@@ -385,8 +392,8 @@ func Test_Update_ignores_unrelated_records(t *testing.T) {
 	}
 	sort.Strings(hosts)
 	assert.Equal(t, []string{
-		"example.com=mail.example.com",
-		"other.example.com=9.9.9.9",
-		"vpn.example.com=1.1.1.1",
+		"=mail.example.com",
+		"other=9.9.9.9",
+		"vpn=1.1.1.1",
 	}, hosts)
 }

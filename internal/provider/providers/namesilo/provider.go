@@ -26,6 +26,7 @@ type Provider struct {
 	ipv6Suffix netip.Prefix
 	key        string
 	ttl        *uint32
+	cleanup    bool
 }
 
 type apiResponse struct {
@@ -48,6 +49,9 @@ func New(data json.RawMessage, domain, owner string,
 	var providerSpecificSettings struct {
 		Key string  `json:"key"`
 		TTL *uint32 `json:"ttl,omitempty"`
+		// Cleanup, when true, makes the updater proactively prune stale
+		// A/AAAA records for this host. See StaleRecordCleanup.
+		Cleanup bool `json:"cleanup,omitempty"`
 	}
 	err = json.Unmarshal(data, &providerSpecificSettings)
 	if err != nil {
@@ -66,7 +70,27 @@ func New(data json.RawMessage, domain, owner string,
 		ipv6Suffix: ipv6Suffix,
 		key:        providerSpecificSettings.Key,
 		ttl:        providerSpecificSettings.TTL,
+		cleanup:    providerSpecificSettings.Cleanup,
 	}, nil
+}
+
+// StaleRecordCleanup reports whether the updater should aggressively reconcile
+// this host down to a single record on every cycle, even when the public IP is
+// already present among the resolved records.
+//
+// By default the updater treats a host as "up to date" the moment the public IP
+// appears in the DNS answer — so if extra A/AAAA records linger (e.g. created by
+// older buggy clients, or a manual edit), they are never noticed and never
+// pruned. With cleanup enabled, the update Service detects "more records resolve
+// than the single one we manage" and forces this provider's Update to run, which
+// reconciles the host to exactly one record (see Update). It is opt-in because a
+// host may legitimately have multiple records (round-robin); turning it on tells
+// the updater "this host must resolve to exactly one record, prune the rest".
+//
+// This is consumed via an optional interface in internal/update so the Provider
+// interface stays unchanged for the ~60 providers that don't implement it.
+func (p *Provider) StaleRecordCleanup() bool {
+	return p.cleanup
 }
 
 func validateSettings(domain, key string, ttl *uint32) (err error) {

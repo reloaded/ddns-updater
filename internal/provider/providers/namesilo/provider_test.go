@@ -16,6 +16,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func Test_New_cleanup_flag(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		data    string
+		cleanup bool
+	}{
+		"absent_defaults_false": {
+			data:    `{"key":"abc"}`,
+			cleanup: false,
+		},
+		"explicit_false": {
+			data:    `{"key":"abc","cleanup":false}`,
+			cleanup: false,
+		},
+		"explicit_true": {
+			data:    `{"key":"abc","cleanup":true}`,
+			cleanup: true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			provider, err := New(json.RawMessage(tc.data), "vpn.example.com", "vpn",
+				ipversion.IP4, netip.Prefix{})
+			require.NoError(t, err)
+			assert.Equal(t, tc.cleanup, provider.StaleRecordCleanup())
+		})
+	}
+}
+
 func Test_hostMatches(t *testing.T) {
 	t.Parallel()
 

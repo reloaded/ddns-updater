@@ -3,13 +3,13 @@ package namesilo
 import (
 	"context"
 	"encoding/json"
-	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/qdm12/ddns-updater/internal/models"
 	"github.com/qdm12/ddns-updater/internal/provider/constants"
@@ -127,62 +127,108 @@ func (p *Provider) HTML() models.HTMLRow {
 	}
 }
 
-// Update does the following:
-// 1. if there's no record, create it.
-// 2. if it exists and ip is different, update it.
-// 3. if it exists and ip is the same, do nothing.
+type matchedRecord struct {
+	ID    string
+	Value string
+}
+
+// Update reconciles NameSilo's records for (host, type) to a single record
+// pointing at newIP. The state-machine is:
+//
+//  1. no record           -> create it
+//  2. one record, IP ok   -> no-op
+//  3. one record, IP off  -> update in place
+//  4. multiple records    -> keep one, delete the rest, then update if needed
+//
+// Case (4) is the self-healing path: an earlier version of this provider, or
+// any out-of-band edit, could leave behind a stale A/AAAA record at the same
+// host. Every reconcile run now converges to exactly one managed record.
 func (p *Provider) Update(ctx context.Context, client *http.Client, newIP netip.Addr) (netip.Addr, error) {
 	recordType := constants.A
 	if newIP.Is6() {
 		recordType = constants.AAAA
 	}
 
-	recordID, currentIP, err := p.getRecord(ctx, client, recordType)
+	records, err := p.getRecords(ctx, client, recordType)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("retrieving records: %w", err)
+	}
 
-	if stderrors.Is(err, errors.ErrRecordNotFound) {
+	if len(records) == 0 {
 		if err := p.createRecord(ctx, client, recordType, newIP); err != nil {
 			return netip.Addr{}, fmt.Errorf("creating record: %w", err)
 		}
 		return newIP, nil
-	} else if err != nil {
-		return netip.Addr{}, fmt.Errorf("retrieving records: %w", err)
 	}
 
-	if currentIP != newIP {
-		if err := p.updateRecord(ctx, client, recordID, newIP); err != nil {
-			return netip.Addr{}, fmt.Errorf("updating record: %w", err)
+	// Pick a winner. If any existing record already has the target IP, keep
+	// that one so we can no-op without an unnecessary update API call.
+	keep := records[0]
+	for _, r := range records {
+		if ip, parseErr := netip.ParseAddr(r.Value); parseErr == nil && ip == newIP {
+			keep = r
+			break
 		}
 	}
 
+	for _, r := range records {
+		if r.ID == keep.ID {
+			continue
+		}
+		if err := p.deleteRecord(ctx, client, r.ID); err != nil {
+			return netip.Addr{}, fmt.Errorf("deleting duplicate record %s: %w", r.ID, err)
+		}
+	}
+
+	currentIP, err := netip.ParseAddr(keep.Value)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("parsing existing IP: %w", err)
+	}
+	if currentIP == newIP {
+		return newIP, nil
+	}
+	if err := p.updateRecord(ctx, client, keep.ID, newIP); err != nil {
+		return netip.Addr{}, fmt.Errorf("updating record: %w", err)
+	}
 	return newIP, nil
 }
 
+// hostMatches compares NameSilo's host field against the expected FQDN
+// tolerantly: case-insensitive and ignoring an optional trailing dot. The old
+// strict equality check meant any quirk in how NameSilo returned the host
+// (uppercase, absolute "name.example.com.") caused getRecord to miss the
+// existing record and fall back to dnsAddRecord, leaving a duplicate behind.
+func hostMatches(recordHost, expectedHost string) bool {
+	return strings.EqualFold(
+		strings.TrimSuffix(recordHost, "."),
+		strings.TrimSuffix(expectedHost, "."),
+	)
+}
+
+// getRecords returns every record matching (host, type). An empty slice with a
+// nil error means "no matches" — callers should treat this as the create case
+// rather than relying on a sentinel ErrRecordNotFound.
+//
 // https://www.namesilo.com/api-reference#dns/dns-list-records
-func (p *Provider) getRecord(ctx context.Context, client *http.Client, recordType string) (
-	id *string, ip netip.Addr, err error,
+func (p *Provider) getRecords(ctx context.Context, client *http.Client, recordType string) (
+	records []matchedRecord, err error,
 ) {
 	queryParams := url.Values{}
-	url := p.createRequestURL("/api/dnsListRecords", queryParams)
+	requestURL := p.createRequestURL("/api/dnsListRecords", queryParams)
 
-	response, err := p.sendAPIRequest(ctx, client, url)
+	response, err := p.sendAPIRequest(ctx, client, requestURL)
 	if err != nil {
-		return nil, netip.Addr{}, err
+		return nil, err
 	}
 
-	// find matching record
-	host := utils.BuildURLQueryHostname(p.owner, p.domain)
+	expectedHost := utils.BuildURLQueryHostname(p.owner, p.domain)
 	for _, record := range response.Reply.Records {
-		if record.Host != host || record.Type != recordType {
+		if !hostMatches(record.Host, expectedHost) || record.Type != recordType {
 			continue
 		}
-		ip, err = netip.ParseAddr(record.Value)
-		if err != nil {
-			return nil, netip.Addr{}, fmt.Errorf("parsing existing IP: %w", err)
-		}
-		return &record.ID, ip, nil
+		records = append(records, matchedRecord{ID: record.ID, Value: record.Value})
 	}
-
-	return nil, netip.Addr{}, fmt.Errorf("%w", errors.ErrRecordNotFound)
+	return records, nil
 }
 
 // https://www.namesilo.com/api-reference#dns/dns-add-record
@@ -206,12 +252,28 @@ func (p *Provider) createRecord(
 func (p *Provider) updateRecord(
 	ctx context.Context,
 	client *http.Client,
-	recordID *string,
+	recordID string,
 	ip netip.Addr,
 ) error {
 	const path = "/api/dnsUpdateRecord"
 	queryParams := p.buildRecordParams(ip)
-	queryParams.Set("rrid", *recordID)
+	queryParams.Set("rrid", recordID)
+
+	url := p.createRequestURL(path, queryParams)
+
+	_, err := p.sendAPIRequest(ctx, client, url)
+	return err
+}
+
+// https://www.namesilo.com/api-reference#dns/dns-delete-record
+func (p *Provider) deleteRecord(
+	ctx context.Context,
+	client *http.Client,
+	recordID string,
+) error {
+	const path = "/api/dnsDeleteRecord"
+	queryParams := url.Values{}
+	queryParams.Set("rrid", recordID)
 
 	url := p.createRequestURL(path, queryParams)
 

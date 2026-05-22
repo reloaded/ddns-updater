@@ -202,7 +202,19 @@ func (s *Service) shouldUpdateRecord(ctx context.Context, record librecords.Reco
 		lastIP := record.History.GetCurrentIP() // can be nil
 		return s.shouldUpdateRecordNoLookup(hostname, ipVersion, lastIP, publicIP)
 	}
-	return s.shouldUpdateRecordWithLookup(ctx, hostname, ipVersion, publicIP)
+	return s.shouldUpdateRecordWithLookup(ctx, hostname, ipVersion, publicIP, providerWantsStaleCleanup(record))
+}
+
+// staleRecordCleaner is an optional interface a provider may implement to opt
+// into proactive stale-record pruning. It is checked via a type assertion so
+// the core Provider interface (implemented by ~60 providers) stays unchanged.
+type staleRecordCleaner interface {
+	StaleRecordCleanup() bool
+}
+
+func providerWantsStaleCleanup(record librecords.Record) bool {
+	cleaner, ok := record.Provider.(staleRecordCleaner)
+	return ok && cleaner.StaleRecordCleanup()
 }
 
 func (s *Service) shouldUpdateRecordNoLookup(hostname string, ipVersion ipversion.IPVersion,
@@ -218,7 +230,7 @@ func (s *Service) shouldUpdateRecordNoLookup(hostname string, ipVersion ipversio
 }
 
 func (s *Service) shouldUpdateRecordWithLookup(ctx context.Context, hostname string,
-	ipVersion ipversion.IPVersion, publicIP netip.Addr,
+	ipVersion ipversion.IPVersion, publicIP netip.Addr, cleanup bool,
 ) (update bool) {
 	const tries = 5
 	recordIPv4s, recordIPv6s, err := s.lookupIPsResilient(ctx, hostname, tries)
@@ -244,6 +256,19 @@ func (s *Service) shouldUpdateRecordWithLookup(ctx context.Context, hostname str
 		s.logInfoLookupUpdate(hostname, ipKind, recordIPs, publicIP)
 		return true
 	}
+
+	// The public IP is already present. Normally that means "up to date" and we
+	// skip — but that tolerates *extra* records lingering at the same host
+	// (stale duplicates). When the provider opted into cleanup and DNS resolves
+	// more than the single record we manage, force the update so the provider
+	// can prune the host down to exactly one record.
+	if cleanup && publicIP.IsValid() && len(recordIPs) > 1 {
+		s.logger.Info(fmt.Sprintf(
+			"%s resolves to %d %s records (%s); cleaning up stale records, keeping %s",
+			hostname, len(recordIPs), ipKind, ipsToString(recordIPs), publicIP))
+		return true
+	}
+
 	s.logDebugLookupSkip(hostname, ipKind, recordIPs, publicIP)
 	return false
 }

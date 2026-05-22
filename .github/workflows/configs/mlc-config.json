@@ -38,6 +38,12 @@
     },
     {
       "pattern": "^https://cp.servercow.de"
+    },
+    {
+      "pattern": "^https://dockeri.co"
+    },
+    {
+      "pattern": "^https://hub.docker.com"
     }
   ],
   "timeout": "20s",
